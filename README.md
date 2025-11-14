@@ -1,3 +1,8 @@
+> **Note:** This project includes two implementations:
+> - **`master` branch** ([http_client_post_sensor_data](https://github.com/Ata-Pab/esp-http_client_post_sensor_data)): Plain HTTP implementation
+> - This **`secure_https_client_post_sensor_data` branch**: Secure HTTPS implementation
+
+
 ## Project Overview: `secure_https_client_post_sensor_data`
 
 1. **SNTP time sync** — essential for HTTPS certificate validation (TLS requires accurate system time).
