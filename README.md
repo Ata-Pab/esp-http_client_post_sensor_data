@@ -1,122 +1,88 @@
-## Project Overview: `http_client_post_sensor_data`
+## Project Overview: `secure_https_client_post_sensor_data`
 
-Connect ESP32 to a Wi-Fi network → periodically send JSON-formatted data (e.g. sensor or UART data) via HTTPS to a test server → handle reconnection and task synchronization safely with FreeRTOS mechanisms.
-
-## ⚙️ Architecture
-
-```
-+---------------------------+
-|        Wi-Fi Task         |
-| - Connect to AP           |
-| - Manage reconnections    |
-| - Signal Network Ready    |
-+-------------+-------------+
-              |
-              v
-+---------------------------+
-|     Data Producer Task    |
-| - Generate sample data    |
-| - Send via Queue          |
-+-------------+-------------+
-              |
-              v
-+---------------------------+
-|     HTTP Client Task      |
-| - Wait for Network Ready  |
-| - Read from Queue         |
-| - POST JSON to Server     |
-+---------------------------+
-```
+1. **SNTP time sync** — essential for HTTPS certificate validation (TLS requires accurate system time).
+2. **Static CA PEM with `esp_crt_bundle_attach()`**, meaning the ESP32 now uses Espressif’s built-in trusted CA store — just like browsers do.
 
 ---
 
-## 📂 Project Structure
+### Improvements made on top of the ```http_client_post_sensor_data``` project
+
+| Area                   | Old approach         | New approach                                  | Why it matters                                                            |
+| ---------------------- | -------------------- | --------------------------------------------- | ------------------------------------------------------------------------- |
+| **Time handling**      | No SNTP              | Added NTP time sync                           | Certificates are time-bound; ESP must know the correct date/time.         |
+| **TLS trust store**    | Custom CA PEM        | Espressif CA bundle (`esp_crt_bundle_attach`) | No manual certificate updates — works with any valid public HTTPS server. |
+| **Wi-Fi reconnection** | Basic reconnect loop | Semaphore-based, state-tracked                | Thread-safe and cooperative with FreeRTOS tasks.                          |
+| **Error handling**     | Retry logic          | Queue + reconnection request                  | Reliable for unstable connections.                                        |
+
+## SNTP + TLS
 
 ```
-wifi_http_client_demo/
-├── main/
-│   ├── main.c
-│   ├── wifi_manager.c
-│   ├── wifi_manager.h
-│   ├── http_client.c
-│   ├── http_client.h
-│   ├── CMakeLists.txt
-├── sdkconfig.defaults
-├── CMakeLists.txt
-├── .gitignore
-└── README.md
+     ┌──────────────────────────────┐
+     │         HTTPS Server         │
+     │  (has certificate signed by  │
+     │   Let's Encrypt / DigiCert)  │
+     └───────────────┬──────────────┘
+                     │
+           TLS Handshake (Verify cert)
+                     │
+             ┌───────┴────────┐
+             │  ESP32 Client  │
+             │  + SNTP Time   │
+             │  + CA Bundle   │
+             └────────────────┘
 ```
 
----
+If SNTP hasn’t set the ```current time``` yet, ESP thinks it’s year **1970**, and all certificates appear “not yet valid,”
+causing:
 
-## FreeRTOS Features Used
+```
+E (xxxx) esp-tls-mbedtls: mbedtls_ssl_handshake returned -0x2700
+```
 
-| Feature                | Used For                                       |
-| ---------------------- | ---------------------------------------------- |
-| Queue                  | Send JSON messages between producer and client |
-| Binary Semaphore       | Signal “Wi-Fi connected”                       |
-| Task Notifications     | Notify reconnect events                        |
-| Static Task Allocation | For critical system tasks (optional toggle)    |
+Now, synchronize time before HTTPS, certificate validation will succeed.
 
----
 
-## Configuration (menuconfig)
+## Implementation Checks
 
-* Wi-Fi SSID & Password
-* Server URL (e.g., `https://httpbin.org/post`)
-* POST interval (seconds)
-* Optional: enable static task allocation
+1. **Make sure SNTP has finished sync before the HTTPS request.**
+   ```c
+   while (!s_time_synced && retry < retry_count)
+   ```
+2. **Confirm ESP-IDF build includes the CA bundle.**
+   `sdkconfig`:
 
----
+   ```
+   CONFIG_ESP_TLS_USING_MBEDTLS=y
+   CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+   CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+   ```
+
+   → If not, run `idf.py menuconfig → Component config → mbedTLS → Certificate Bundle`.
+
+3. **Don’t call `wifi_manager_request_reconnect()` on TLS failure anymore**,
+   since now the failure is not related to Wi-Fi.
+
 
 ## Serial Output Example
 
 ```
-Wi-Fi connected. IP: 192.168.1.105
-[Producer] Sent new data: {"temp": 25.6, "humidity": 42}
-[HTTP] POST success (200)
-[Producer] Sent new data: {"temp": 25.7, "humidity": 43}
-[HTTP] POST success (200)
+I (4823) wifi_manager: Got IP: 192.168.1.15
+I (4833) wifi_manager: Initializing SNTP
+I (6850) wifi_manager: Time synchronized via SNTP
+I (6850) wifi_manager: Current time: 2025-11-09 14:20:31
+I (6860) http_client: HTTPS POST Status = 200, content_length = 34
 ```
 
-## Plain HTTP demo for ESP32 using FreeRTOS + ESP-IDF.
+## Project Concept Summary
 
-- Connects to configured Wi-Fi (edit SSID/PASS in `main/wifi_manager.c`)
-- Producer task creates JSON messages every 5s and enqueues them
-- HTTP task posts queued messages to http://httpbin.org/post (plain HTTP)
-- Uses FreeRTOS Queue, semaphore for Wi-Fi ready, and task notifications
-
-## Build & Flash
-
-```bash
-idf.py set-target esp32
-idf.py build
-idf.py -p /dev/ttyUSB0 flash monitor
+```
+Wi-Fi Manager (FreeRTOS Task)
+     ↓ gives semaphore
+SNTP Time Sync
+     ↓ ensures clock valid
+HTTP(S) Client Task
+     ↓ uses esp_crt_bundle for TLS
+Server Communication
 ```
 
-
-## How it uses FreeRTOS features (quick mapping)
-- **Queue**: `xMessageQueue` carries JSON payloads from Producer → HTTP task.
-- **Semaphore**: `s_wifi_connected_sem` (in wifi_manager) signals the first "got IP" event to waiting task(s).
-- **Task Notifications**: `xTaskNotifyGive(xHttpTaskHandle)` is used as an optional kick to immediately wake the HTTP task after enqueue.
-- **(Optional) Static allocation**: The code uses dynamic creation by default; if you want, we can convert `xTaskCreate` → `xTaskCreateStatic` for `http_task` & `producer_task` and allocate stacks/TCBs statically — I can add that on request.
-
 ---
-
-## How to test quickly (no server set up)
-1. Edit `main/wifi_manager.c` and set `WIFI_SSID` and `WIFI_PASS`.
-2. `idf.py build`
-3. `idf.py -p <PORT> flash monitor`
-4. Observe logs:
-   - Wi-Fi connect, IP address
-   - Producer enqueues JSON every 5s
-   - HTTP task performs POST → httpbin will respond with 200
-
-If you prefer to test against a local server, run a local httpbin or simple HTTP echo server and replace `HTTP_POST_URL`.
-
----
-
-## Next actions (pick one)
-- **Add TLS support** (HTTPS) to this project — showing certificate pinning or CA store verification.
-- **Improve Reliability**: Persistent queue in NVS, exponential backoff, or static task allocation for production.
-- **Add MQTT** next, reusing the queue/synchronization patterns.

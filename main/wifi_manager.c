@@ -1,8 +1,11 @@
 #include <string.h>
+#include <time.h>
+#include <sys/time.h>
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_sntp.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -18,8 +21,25 @@ static const char *TAG = "wifi_manager";
 #define WIFI_PASS "xxxxxxxxxx"
 
 static SemaphoreHandle_t s_wifi_connected_sem = NULL;
+static bool s_is_connected = false;
+static bool s_time_synced = false;
 static esp_event_handler_instance_t instance_any_id;
 static esp_event_handler_instance_t instance_got_ip;
+
+static void time_sync_notification_cb(struct timeval *tv)
+{
+    ESP_LOGI(TAG, "Time synchronized via SNTP");
+    s_time_synced = true;
+}
+
+static void initialize_sntp(void)
+{
+    ESP_LOGI(TAG, "Initializing SNTP");
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+    esp_sntp_init();
+}
 
 void wifi_event_handler(void *arg, esp_event_base_t event_base,
                         int32_t event_id, void *event_data)
@@ -35,8 +55,8 @@ void wifi_event_handler(void *arg, esp_event_base_t event_base,
         {
             wifi_event_sta_disconnected_t *disconn_evt = (wifi_event_sta_disconnected_t *)event_data;
             ESP_LOGW(TAG, "WIFI_EVENT_STA_DISCONNECTED -> reason=%d, trying to reconnect...", disconn_evt->reason);
+            s_is_connected = false; // Mark as disconnected
             esp_wifi_connect();
-            // Note: we do not clear the connected semaphore here; wait will block again
         }
     }
     else if (event_base == IP_EVENT)
@@ -45,6 +65,14 @@ void wifi_event_handler(void *arg, esp_event_base_t event_base,
         {
             ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
             ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
+            s_is_connected = true; // Mark as connected
+            
+            // Initialize SNTP for time sync (needed for HTTPS certificate validation)
+            if (!s_time_synced)
+            {
+                initialize_sntp();
+            }
+            
             xSemaphoreGive(s_wifi_connected_sem); // signal connected
         }
     }
@@ -103,8 +131,51 @@ BaseType_t wifi_manager_wait_connected(TickType_t ticks_to_wait)
 {
     if (s_wifi_connected_sem == NULL)
         return pdFALSE;
+    
+    // If already connected, return immediately
+    if (s_is_connected)
+    {
+        return pdTRUE;
+    }
+    
     // Wait for the semaphore to be given in IP_EVENT_STA_GOT_IP
-    return xSemaphoreTake(s_wifi_connected_sem, ticks_to_wait);
+    BaseType_t result = xSemaphoreTake(s_wifi_connected_sem, ticks_to_wait);
+    
+    // Give the semaphore back immediately so it can be taken again
+    // This allows multiple tasks to wait on the same connection event
+    if (result == pdTRUE)
+    {
+        xSemaphoreGive(s_wifi_connected_sem);
+        
+        // Wait for time sync (important for HTTPS)
+        if (!s_time_synced)
+        {
+            ESP_LOGI(TAG, "Waiting for time sync...");
+            int retry = 0;
+            const int retry_count = 15; // Wait up to 15 seconds for time sync
+            while (!s_time_synced && retry < retry_count)
+            {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                retry++;
+            }
+            if (s_time_synced)
+            {
+                time_t now;
+                struct tm timeinfo;
+                time(&now);
+                localtime_r(&now, &timeinfo);
+                ESP_LOGI(TAG, "Current time: %04d-%02d-%02d %02d:%02d:%02d",
+                         timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                         timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+            }
+            else
+            {
+                ESP_LOGW(TAG, "Time sync timeout - HTTPS may fail");
+            }
+        }
+    }
+    
+    return result;
 }
 
 void wifi_manager_request_reconnect(void)
